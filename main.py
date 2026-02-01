@@ -34,7 +34,27 @@ logging.basicConfig(
 )
 
 
-# ========= TIME GUARDS =========
+# ========= HELPERS =========
+def clean_number(value):
+    """Convert Mboum string numbers like '$55,187,800' or '73.13%' to float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = (
+            value.replace("$", "")
+                 .replace(",", "")
+                 .replace("%", "")
+                 .strip()
+        )
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+    return None
+
+
 def is_trading_time_now() -> bool:
     now = datetime.now(TZ_NY)
     if now.weekday() > 4:
@@ -46,7 +66,6 @@ def is_trading_time_now() -> bool:
     return market_open <= now <= market_close
 
 
-# ========= TELEGRAM =========
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Telegram credentials missing")
@@ -67,7 +86,6 @@ def send_telegram(text: str):
         logging.error(f"Telegram exception: {e}")
 
 
-# ========= MBOUM HELPER =========
 def mboum_get(url: str, params: dict | None = None):
     headers = {"Authorization": f"Bearer {MBOUM_API_KEY}"}
     try:
@@ -100,26 +118,35 @@ def classify_flow_signal(trade: dict):
     Map Mboum unusual options trade -> CALL/PUT + direction.
     You MUST adapt field names to actual Mboum response.
     Example assumed keys:
-      ticker, optionType, side, premium, strike, expirationDate, delta, id
+      ticker, symbolType/optionType, side, premium, strikePrice, expiration, delta, id
     """
     ticker = trade.get("ticker")
     if ticker not in WATCHLIST:
         return None
 
-    opt_type = trade.get("optionType")  # "CALL" / "PUT"
-    side = trade.get("side")           # "BUY" / "SELL"
-    premium = trade.get("premium")
-    strike = trade.get("strike")
-    expiration = trade.get("expirationDate")
-    delta = trade.get("delta")
-    trade_id = trade.get("id") or f"{ticker}-{opt_type}-{strike}-{expiration}-{premium}"
+    # Adjust these keys to match Mboum exactly:
+    opt_type_raw = trade.get("symbolType") or trade.get("optionType")  # "Call"/"Put" or "CALL"/"PUT"
+    side_raw = trade.get("side")  # "buy"/"sell" or "BUY"/"SELL"
+    premium_raw = trade.get("premium")
+    strike_raw = trade.get("strikePrice") or trade.get("strike")
+    expiration = trade.get("expiration") or trade.get("expirationDate")
+    delta_raw = trade.get("delta")
+    trade_id = trade.get("id") or f"{ticker}-{opt_type_raw}-{strike_raw}-{expiration}-{premium_raw}"
 
     if trade_id in SEEN_TRADE_IDS:
         return None
     SEEN_TRADE_IDS.add(trade_id)
 
+    opt_type = (opt_type_raw or "").upper()
+    side = (side_raw or "").upper()
+
     if opt_type not in ("CALL", "PUT") or side != "BUY":
         return None
+
+    premium = clean_number(premium_raw)
+    strike = clean_number(strike_raw)
+    delta = clean_number(delta_raw)
+
     if premium is None or premium < 50000:
         return None
     if delta is None:
@@ -142,15 +169,16 @@ def classify_flow_signal(trade: dict):
 def fetch_ema_trend(ticker: str):
     """
     Simple trend proxy: price vs EMA(50, 5m).
+    You MUST adapt price field names to actual Mboum schema.
     """
-    # Price proxy from v3 options (you may swap to a pure quote endpoint if available)
     price_url = "https://api.mboum.com/v3/markets/options"
     price_data = mboum_get(price_url, {"ticker": ticker})
     if not price_data:
         return None
 
-    # You MUST adapt this to actual schema.
-    last_price = price_data.get("underlyingPrice") or price_data.get("lastPrice")
+    # Example: underlyingPrice or lastPrice
+    last_price_raw = price_data.get("underlyingPrice") or price_data.get("lastPrice")
+    last_price = clean_number(last_price_raw)
     if last_price is None:
         return None
 
@@ -164,14 +192,14 @@ def fetch_ema_trend(ticker: str):
     })
     ema_val = None
     if ema_data and isinstance(ema_data, dict):
+        # Example schema: {"values":[{"ema":"123.45"}]}
         values = ema_data.get("values") or ema_data.get("data")
         if isinstance(values, list) and values:
-            ema_val = values[-1].get("ema") or values[-1].get("EMA")
+            ema_val = clean_number(values[-1].get("ema") or values[-1].get("EMA"))
 
     if ema_val is None:
         return None
 
-    # Trend proxy: price above EMA -> uptrend, below -> downtrend
     if last_price > ema_val:
         return "UP"
     elif last_price < ema_val:
@@ -203,7 +231,7 @@ def fetch_indicators(ticker: str):
     if rsi_data and isinstance(rsi_data, dict):
         vals = rsi_data.get("values") or rsi_data.get("data")
         if isinstance(vals, list) and vals:
-            indicators["rsi"] = vals[-1].get("rsi") or vals[-1].get("RSI")
+            indicators["rsi"] = clean_number(vals[-1].get("rsi") or vals[-1].get("RSI"))
 
     # MACD
     macd_url = "https://api.mboum.com/v1/markets/indicators/macd"
@@ -219,7 +247,7 @@ def fetch_indicators(ticker: str):
     if macd_data and isinstance(macd_data, dict):
         vals = macd_data.get("values") or macd_data.get("data")
         if isinstance(vals, list) and vals:
-            indicators["macd"] = vals[-1].get("macd") or vals[-1].get("MACD")
+            indicators["macd"] = clean_number(vals[-1].get("macd") or vals[-1].get("MACD"))
 
     # ADX
     adx_url = "https://api.mboum.com/v1/markets/indicators/adx"
@@ -232,12 +260,12 @@ def fetch_indicators(ticker: str):
     if adx_data and isinstance(adx_data, dict):
         vals = adx_data.get("values") or adx_data.get("data")
         if isinstance(vals, list) and vals:
-            indicators["adx"] = vals[-1].get("adx") or vals[-1].get("ADX")
+            indicators["adx"] = clean_number(vals[-1].get("adx") or vals[-1].get("ADX"))
 
     return indicators
 
 
-# ========= NEWS SENTIMENT (SIMPLE) =========
+# ========= NEWS SENTIMENT =========
 def fetch_news_sentiment(ticker: str):
     """
     Very simple sentiment proxy: count positive/negative keywords in recent headlines.
@@ -248,7 +276,7 @@ def fetch_news_sentiment(ticker: str):
     if not data:
         return 0
 
-    # Assume data is a list of articles with "title" or "headline"
+    # Assume data is a list of articles or {"results":[...]}
     articles = data if isinstance(data, list) else data.get("results", [])
     if not isinstance(articles, list):
         return 0
@@ -266,7 +294,6 @@ def fetch_news_sentiment(ticker: str):
         if any(w in title for w in negative_words):
             score -= 1
 
-    # Clamp between -2 and +2
     if score > 2:
         score = 2
     if score < -2:
@@ -274,15 +301,11 @@ def fetch_news_sentiment(ticker: str):
     return score
 
 
-# ========= CONFIDENCE FUSION =========
+# ========= CONFIDENCE =========
 def compute_confidence(flow_sig: dict, trend: str | None, indicators: dict, news_score: int):
-    """
-    Combine flow + trend + indicators + news into a confidence score.
-    """
     direction = flow_sig["direction"]  # BULLISH / BEARISH
     base = 60  # base from flow
 
-    # Flow strength: premium + |delta|
     premium = flow_sig["premium"]
     delta = flow_sig["delta"]
     if premium >= 150000:
@@ -290,7 +313,6 @@ def compute_confidence(flow_sig: dict, trend: str | None, indicators: dict, news
     if abs(delta) >= 0.6:
         base += 10
 
-    # Trend alignment
     if trend == "UP" and direction == "BULLISH":
         base += 10
     elif trend == "DOWN" and direction == "BEARISH":
@@ -298,35 +320,30 @@ def compute_confidence(flow_sig: dict, trend: str | None, indicators: dict, news
     elif trend in ("UP", "DOWN"):
         base -= 5
 
-    # Indicators
     rsi = indicators.get("rsi")
     macd = indicators.get("macd")
     adx = indicators.get("adx")
 
     if rsi is not None:
-        # Overbought/oversold slight adjustments
         if direction == "BULLISH" and rsi < 35:
             base += 5
         if direction == "BEARISH" and rsi > 65:
             base += 5
 
     if macd is not None:
-        # MACD sign alignment
         if direction == "BULLISH" and macd > 0:
             base += 5
         if direction == "BEARISH" and macd < 0:
             base += 5
 
     if adx is not None and adx >= 20:
-        base += 5  # stronger trend
+        base += 5
 
-    # News
     if news_score > 0 and direction == "BULLISH":
         base += 5
     if news_score < 0 and direction == "BEARISH":
         base += 5
 
-    # Clamp
     if base < 10:
         base = 10
     if base > 99:
@@ -335,7 +352,6 @@ def compute_confidence(flow_sig: dict, trend: str | None, indicators: dict, news
     return base
 
 
-# ========= MESSAGE FORMAT =========
 def format_signal_message(flow_sig: dict, trend: str | None, indicators: dict, news_score: int, confidence: int) -> str:
     ticker = flow_sig["ticker"]
     direction = flow_sig["direction"]
@@ -398,7 +414,6 @@ def main():
 
                 ticker = flow_sig["ticker"]
 
-                # Trend + indicators + news
                 trend = fetch_ema_trend(ticker)
                 indicators = fetch_indicators(ticker)
                 news_score = fetch_news_sentiment(ticker)
