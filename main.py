@@ -3,7 +3,6 @@ import time
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 import requests
 
 # ========= CONFIG =========
@@ -17,15 +16,10 @@ MBOUM_API_KEY = os.getenv("MBOUM_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SCAN_INTERVAL = 45  # seconds
+SCAN_INTERVAL = 45
 TZ_NY = ZoneInfo("America/New_York")
 
-US_HOLIDAYS = {
-    (1, 1),    # New Year's Day
-    (7, 4),    # Independence Day
-    (12, 25),  # Christmas
-}
-
+US_HOLIDAYS = {(1, 1), (7, 4), (12, 25)}
 SEEN_TRADE_IDS = set()
 
 logging.basicConfig(
@@ -33,10 +27,8 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-
 # ========= HELPERS =========
 def clean_number(value):
-    """Convert Mboum string numbers like '$55,187,800' or '73.13%' to float."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -50,83 +42,58 @@ def clean_number(value):
         )
         try:
             return float(cleaned)
-        except Exception:
+        except:
             return None
     return None
 
-
-def is_trading_time_now() -> bool:
+def is_trading_time_now():
     now = datetime.now(TZ_NY)
     if now.weekday() > 4:
         return False
     if (now.month, now.day) in US_HOLIDAYS:
         return False
-    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=30, second=0, microsecond=0)
-    return market_open <= now <= market_close
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=30, second=0, microsecond=0)
+    return open_t <= now <= close_t
 
-
-def send_telegram(text: str):
+def send_telegram(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Telegram credentials missing")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            logging.error(f"Telegram error: {r.status_code} - {r.text}")
-        else:
-            logging.info("📤 Telegram sent")
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        logging.info("📤 Telegram sent")
     except Exception as e:
-        logging.error(f"Telegram exception: {e}")
+        logging.error(f"Telegram error: {e}")
 
-
-def mboum_get(url: str, params: dict | None = None):
+def mboum_get(url, params=None):
     headers = {"Authorization": f"Bearer {MBOUM_API_KEY}"}
     try:
-        start = time.time()
         resp = requests.get(url, headers=headers, params=params or {}, timeout=10)
-        duration = round(time.time() - start, 2)
-        logging.info(f"📡 {url} - {resp.status_code} - {duration}s")
+        logging.info(f"📡 {url} - {resp.status_code}")
         if resp.status_code != 200:
-            logging.warning(f"Mboum status {resp.status_code}: {resp.text}")
             return None
         return resp.json()
     except Exception as e:
-        logging.error(f"Mboum request error: {e}")
+        logging.error(f"Mboum error: {e}")
         return None
 
-
 # ========= UNUSUAL OPTIONS =========
-def fetch_unusual_options_page(page: int = 1):
+def fetch_unusual_options_page(page=1):
     url = "https://api.mboum.com/v1/markets/options/unusual-options-activity"
     data = mboum_get(url, {"type": "STOCKS", "page": str(page)})
     if not data:
         return []
-    # Adjust to actual schema; assuming {"results": [ {...}, ... ]}
-    results = data.get("results", [])
-    return results if isinstance(results, list) else []
+    return data.get("results", [])
 
-
-def classify_flow_signal(trade: dict):
-    """
-    Map Mboum unusual options trade -> CALL/PUT + direction.
-    You MUST adapt field names to actual Mboum response.
-    Example assumed keys:
-      ticker, symbolType/optionType, side, premium, strikePrice, expiration, delta, id
-    """
+def classify_flow_signal(trade):
     ticker = trade.get("ticker")
     if ticker not in WATCHLIST:
         return None
 
-    # Adjust these keys to match Mboum exactly:
-    opt_type_raw = trade.get("symbolType") or trade.get("optionType")  # "Call"/"Put" or "CALL"/"PUT"
-    side_raw = trade.get("side")  # "buy"/"sell" or "BUY"/"SELL"
+    opt_type_raw = trade.get("symbolType") or trade.get("optionType")
+    side_raw = trade.get("side")
     premium_raw = trade.get("premium")
     strike_raw = trade.get("strikePrice") or trade.get("strike")
     expiration = trade.get("expiration") or trade.get("expirationDate")
@@ -164,38 +131,29 @@ def classify_flow_signal(trade: dict):
         "delta": delta,
     }
 
-
 # ========= TREND / INDICATORS =========
-def fetch_ema_trend(ticker: str):
-    """
-    Simple trend proxy: price vs EMA(50, 5m).
-    You MUST adapt price field names to actual Mboum schema.
-    """
-    price_url = "https://api.mboum.com/v3/markets/options"
-    price_data = mboum_get(price_url, {"ticker": ticker})
+def fetch_ema_trend(ticker):
+    price_data = mboum_get("https://api.mboum.com/v3/markets/options", {"ticker": ticker})
     if not price_data:
         return None
 
-    # Example: underlyingPrice or lastPrice
-    last_price_raw = price_data.get("underlyingPrice") or price_data.get("lastPrice")
-    last_price = clean_number(last_price_raw)
+    last_price = clean_number(price_data.get("underlyingPrice") or price_data.get("lastPrice"))
     if last_price is None:
         return None
 
-    ema_url = "https://api.mboum.com/v1/markets/indicators/ema"
-    ema_data = mboum_get(ema_url, {
+    ema_data = mboum_get("https://api.mboum.com/v1/markets/indicators/ema", {
         "ticker": ticker,
         "interval": "5m",
         "series_type": "close",
         "time_period": "50",
         "limit": "1",
     })
+
     ema_val = None
-    if ema_data and isinstance(ema_data, dict):
-        # Example schema: {"values":[{"ema":"123.45"}]}
-        values = ema_data.get("values") or ema_data.get("data")
-        if isinstance(values, list) and values:
-            ema_val = clean_number(values[-1].get("ema") or values[-1].get("EMA"))
+    if ema_data:
+        vals = ema_data.get("values") or ema_data.get("data")
+        if vals:
+            ema_val = clean_number(vals[-1].get("ema") or vals[-1].get("EMA"))
 
     if ema_val is None:
         return None
@@ -204,125 +162,80 @@ def fetch_ema_trend(ticker: str):
         return "UP"
     elif last_price < ema_val:
         return "DOWN"
-    else:
-        return "FLAT"
+    return "FLAT"
 
-
-def fetch_indicators(ticker: str):
-    """
-    Fetch a few key indicators: RSI, MACD, ADX.
-    You MUST adapt to actual Mboum response schema.
-    """
-    indicators = {
-        "rsi": None,
-        "macd": None,
-        "adx": None,
-    }
+def fetch_indicators(ticker):
+    out = {"rsi": None, "macd": None, "adx": None}
 
     # RSI
-    rsi_url = "https://api.mboum.com/v1/markets/indicators/rsi"
-    rsi_data = mboum_get(rsi_url, {
-        "ticker": ticker,
-        "interval": "5m",
-        "series_type": "close",
-        "time_period": "14",
-        "limit": "1",
+    rsi_data = mboum_get("https://api.mboum.com/v1/markets/indicators/rsi", {
+        "ticker": ticker, "interval": "5m", "series_type": "close", "time_period": "14", "limit": "1"
     })
-    if rsi_data and isinstance(rsi_data, dict):
+    if rsi_data:
         vals = rsi_data.get("values") or rsi_data.get("data")
-        if isinstance(vals, list) and vals:
-            indicators["rsi"] = clean_number(vals[-1].get("rsi") or vals[-1].get("RSI"))
+        if vals:
+            out["rsi"] = clean_number(vals[-1].get("rsi") or vals[-1].get("RSI"))
 
     # MACD
-    macd_url = "https://api.mboum.com/v1/markets/indicators/macd"
-    macd_data = mboum_get(macd_url, {
-        "ticker": ticker,
-        "interval": "5m",
-        "series_type": "close",
-        "fastperiod": "12",
-        "slowperiod": "26",
-        "signalperiod": "9",
-        "limit": "1",
+    macd_data = mboum_get("https://api.mboum.com/v1/markets/indicators/macd", {
+        "ticker": ticker, "interval": "5m", "series_type": "close",
+        "fastperiod": "12", "slowperiod": "26", "signalperiod": "9", "limit": "1"
     })
-    if macd_data and isinstance(macd_data, dict):
+    if macd_data:
         vals = macd_data.get("values") or macd_data.get("data")
-        if isinstance(vals, list) and vals:
-            indicators["macd"] = clean_number(vals[-1].get("macd") or vals[-1].get("MACD"))
+        if vals:
+            out["macd"] = clean_number(vals[-1].get("macd") or vals[-1].get("MACD"))
 
     # ADX
-    adx_url = "https://api.mboum.com/v1/markets/indicators/adx"
-    adx_data = mboum_get(adx_url, {
-        "ticker": ticker,
-        "interval": "5m",
-        "time_period": "14",
-        "limit": "1",
+    adx_data = mboum_get("https://api.mboum.com/v1/markets/indicators/adx", {
+        "ticker": ticker, "interval": "5m", "time_period": "14", "limit": "1"
     })
-    if adx_data and isinstance(adx_data, dict):
+    if adx_data:
         vals = adx_data.get("values") or adx_data.get("data")
-        if isinstance(vals, list) and vals:
-            indicators["adx"] = clean_number(vals[-1].get("adx") or vals[-1].get("ADX"))
+        if vals:
+            out["adx"] = clean_number(vals[-1].get("adx") or vals[-1].get("ADX"))
 
-    return indicators
-
+    return out
 
 # ========= NEWS SENTIMENT =========
-def fetch_news_sentiment(ticker: str):
-    """
-    Very simple sentiment proxy: count positive/negative keywords in recent headlines.
-    You MUST adapt to actual Mboum news schema.
-    """
-    url = "https://api.mboum.com/v2/markets/news"
-    data = mboum_get(url, {"ticker": ticker, "type": "ALL"})
+def fetch_news_sentiment(ticker):
+    data = mboum_get("https://api.mboum.com/v2/markets/news", {"ticker": ticker, "type": "ALL"})
     if not data:
         return 0
 
-    # Assume data is a list of articles or {"results":[...]}
     articles = data if isinstance(data, list) else data.get("results", [])
     if not isinstance(articles, list):
         return 0
 
-    positive_words = ["beat", "upgrade", "strong", "record", "growth", "surge"]
-    negative_words = ["miss", "downgrade", "lawsuit", "recall", "fraud", "weak"]
+    pos = ["beat", "upgrade", "strong", "record", "growth", "surge"]
+    neg = ["miss", "downgrade", "lawsuit", "recall", "fraud", "weak"]
 
     score = 0
     for art in articles[:5]:
         title = (art.get("title") or art.get("headline") or "").lower()
-        if not title:
-            continue
-        if any(w in title for w in positive_words):
+        if any(w in title for w in pos):
             score += 1
-        if any(w in title for w in negative_words):
+        if any(w in title for w in neg):
             score -= 1
 
-    if score > 2:
-        score = 2
-    if score < -2:
-        score = -2
-    return score
-
+    return max(-2, min(2, score))
 
 # ========= CONFIDENCE =========
-def compute_confidence(flow_sig: dict, trend: str | None, indicators: dict, news_score: int):
-    direction = flow_sig["direction"]  # BULLISH / BEARISH
-    base = 60  # base from flow
+def compute_confidence(flow, trend, ind, news):
+    direction = flow["direction"]
+    base = 60
 
-    premium = flow_sig["premium"]
-    delta = flow_sig["delta"]
-    if premium >= 150000:
+    if flow["premium"] >= 150000:
         base += 10
-    if abs(delta) >= 0.6:
+    if abs(flow["delta"]) >= 0.6:
         base += 10
 
     if trend == "UP" and direction == "BULLISH":
         base += 10
-    elif trend == "DOWN" and direction == "BEARISH":
+    if trend == "DOWN" and direction == "BEARISH":
         base += 10
-    elif trend in ("UP", "DOWN"):
-        base -= 5
 
-    rsi = indicators.get("rsi")
-    macd = indicators.get("macd")
-    adx = indicators.get("adx")
+    rsi, macd, adx = ind["rsi"], ind["macd"], ind["adx"]
 
     if rsi is not None:
         if direction == "BULLISH" and rsi < 35:
@@ -339,96 +252,80 @@ def compute_confidence(flow_sig: dict, trend: str | None, indicators: dict, news
     if adx is not None and adx >= 20:
         base += 5
 
-    if news_score > 0 and direction == "BULLISH":
+    if news > 0 and direction == "BULLISH":
         base += 5
-    if news_score < 0 and direction == "BEARISH":
+    if news < 0 and direction == "BEARISH":
         base += 5
 
-    if base < 10:
-        base = 10
-    if base > 99:
-        base = 99
+    return max(10, min(99, base))
 
-    return base
+# ========= CATEGORY TAGGING =========
+def classify_signal_type(flow, trend, confidence):
+    direction = flow["direction"]
 
+    # Default
+    tag = "[ALL SIGNAL] 🔹"
 
-def format_signal_message(flow_sig: dict, trend: str | None, indicators: dict, news_score: int, confidence: int) -> str:
-    ticker = flow_sig["ticker"]
-    direction = flow_sig["direction"]
-    opt_type = flow_sig["type"]
-    premium = flow_sig["premium"]
-    strike = flow_sig["strike"]
-    expiration = flow_sig["expiration"]
-    delta = flow_sig["delta"]
+    # High confidence
+    if confidence >= 70:
+        tag = "[HIGH CONFIDENCE] 🔥"
 
-    emoji = "🟢" if direction == "BULLISH" else "🔴"
-    conf_tag = "🔥 HIGH CONFIDENCE" if confidence >= 70 else "⚠️ Low/Medium Confidence"
+    # SuperTrend + Flow agreement
+    if (direction == "BULLISH" and trend == "UP") or \
+       (direction == "BEARISH" and trend == "DOWN"):
+        tag = "[SUPER-TREND + FLOW AGREEMENT] 💎"
 
-    trend_str = trend or "UNKNOWN"
-    rsi = indicators.get("rsi")
-    macd = indicators.get("macd")
-    adx = indicators.get("adx")
+    return tag
+
+# ========= MESSAGE FORMAT =========
+def format_signal(flow, trend, ind, news, conf, tag):
+    emoji = "🟢" if flow["direction"] == "BULLISH" else "🔴"
 
     news_text = "Neutral"
-    if news_score > 0:
+    if news > 0:
         news_text = "Positive"
-    elif news_score < 0:
+    elif news < 0:
         news_text = "Negative"
 
-    msg = (
-        f"{emoji} *OPTIONS SIGNAL*: {ticker}\n\n"
-        f"*Direction:* {direction} ({confidence}% confidence) — {conf_tag}\n"
-        f"*Contract:* {opt_type} {strike} exp {expiration}\n"
-        f"*Premium:* ${premium:,.0f}  |  Δ: {delta}\n"
-        f"*Trend:* {trend_str}\n"
-        f"*RSI:* {rsi}  |  *MACD:* {macd}  |  *ADX:* {adx}\n"
+    return (
+        f"{emoji} *OPTIONS SIGNAL*: {flow['ticker']}\n"
+        f"{tag}\n\n"
+        f"*Direction:* {flow['direction']} ({conf}% confidence)\n"
+        f"*Contract:* {flow['type']} {flow['strike']} exp {flow['expiration']}\n"
+        f"*Premium:* ${flow['premium']:,.0f} | Δ {flow['delta']}\n"
+        f"*Trend:* {trend}\n"
+        f"*RSI:* {ind['rsi']} | *MACD:* {ind['macd']} | *ADX:* {ind['adx']}\n"
         f"*News sentiment:* {news_text}\n"
     )
-    return msg
-
 
 # ========= MAIN LOOP =========
 def main():
-    if not MBOUM_API_KEY:
-        logging.error("Missing MBOUM_API_KEY")
-        return
-
     logging.info("🚀 Combined options signal bot started")
 
     while True:
         if not is_trading_time_now():
-            logging.info("⏸ Outside trading hours or holiday/weekend. Sleeping 60s...")
+            logging.info("⏸ Outside trading hours. Sleeping 60s...")
             time.sleep(60)
             continue
 
-        logging.info("🔍 Scanning unusual options activity...")
-        for page in range(1, 3):  # pages 1–2 as example
-            trades = fetch_unusual_options_page(page=page)
-            if not trades:
-                continue
-
+        for page in range(1, 3):
+            trades = fetch_unusual_options_page(page)
             for trade in trades:
-                flow_sig = classify_flow_signal(trade)
-                if not flow_sig:
+                flow = classify_flow_signal(trade)
+                if not flow:
                     continue
 
-                ticker = flow_sig["ticker"]
-
+                ticker = flow["ticker"]
                 trend = fetch_ema_trend(ticker)
-                indicators = fetch_indicators(ticker)
-                news_score = fetch_news_sentiment(ticker)
+                ind = fetch_indicators(ticker)
+                news = fetch_news_sentiment(ticker)
+                conf = compute_confidence(flow, trend, ind, news)
+                tag = classify_signal_type(flow, trend, conf)
 
-                confidence = compute_confidence(flow_sig, trend, indicators, news_score)
-                msg = format_signal_message(flow_sig, trend, indicators, news_score, confidence)
-
-                logging.info(
-                    f"Signal: {ticker} {flow_sig['direction']} {flow_sig['type']} "
-                    f"prem=${flow_sig['premium']:.0f} Δ={flow_sig['delta']} conf={confidence}"
-                )
+                msg = format_signal(flow, trend, ind, news, conf, tag)
                 send_telegram(msg)
 
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
