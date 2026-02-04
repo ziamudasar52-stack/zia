@@ -5,6 +5,7 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 from math import fabs
 import requests
+import yfinance as yf
 
 # ========= CONFIG =========
 WATCHLIST = [
@@ -13,12 +14,8 @@ WATCHLIST = [
     "QQQ", "ORCL", "IBM", "ABNB"
 ]
 
-# Timeframe options:
-# A) 5m  -> "5m"
-# B) 1m  -> "1m"
-# C) 15m -> "15m"
-# D) same as your TV chart -> e.g. "5m", "15m", "1h"
-TIMEFRAME = "5m"
+# Multi-timeframe scanning (Yahoo Finance)
+TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
 MBOUM_API_KEY = os.getenv("MBOUM_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -96,7 +93,7 @@ def send_telegram(text: str):
 
 
 def mboum_get(url, params=None):
-    headers = {"Authorization": f"Bearer {MBOUM_API_KEY}"}
+    headers = {"Authorization": f"Bearer {MBOUM_API_KEY}"} if MBOUM_API_KEY else {}
     try:
         resp = requests.get(url, headers=headers, params=params or {}, timeout=15)
         logging.info(f"📡 {url} - {resp.status_code}")
@@ -108,28 +105,33 @@ def mboum_get(url, params=None):
         return None
 
 
-# ========= OHLC + SUPERTREND =========
-def fetch_ohlc(ticker, interval):
+# ========= YAHOO FINANCE OHLC =========
+def fetch_ohlc_yahoo(ticker, interval):
     """
-    Adapt this endpoint/fields to Mboum's actual candles API.
-    Expecting list of dicts with open/high/low/close.
+    Fetch intraday OHLC from Yahoo Finance for the given interval.
     """
-    url = "https://api.mboum.com/v1/markets/candles"
-    data = mboum_get(url, {"ticker": ticker, "interval": interval, "limit": "200"})
-    if not data or not isinstance(data, list):
+    try:
+        data = yf.download(ticker, period="5d", interval=interval, progress=False)
+    except Exception as e:
+        logging.error(f"Yahoo Finance error for {ticker} {interval}: {e}")
         return []
+
+    if data is None or data.empty:
+        return []
+
     ohlc = []
-    for c in data:
-        o = clean_number(c.get("open"))
-        h = clean_number(c.get("high"))
-        l = clean_number(c.get("low"))
-        cl = clean_number(c.get("close"))
-        if None in (o, h, l, cl):
+    for _, row in data.iterrows():
+        o = clean_number(row.get("Open"))
+        h = clean_number(row.get("High"))
+        l = clean_number(row.get("Low"))
+        c = clean_number(row.get("Close"))
+        if None in (o, h, l, c):
             continue
-        ohlc.append((o, h, l, cl))
+        ohlc.append((o, h, l, c))
     return ohlc
 
 
+# ========= SUPERTREND =========
 def compute_atr(ohlc, period=10):
     if len(ohlc) < period + 1:
         return []
@@ -154,7 +156,6 @@ def compute_atr(ohlc, period=10):
 
 def compute_supertrend_signals(ohlc, period=10, multiplier=3.0):
     """
-    Python port of your TradingView SuperTrend logic (simplified).
     Returns:
       trend_dir: "UP" or "DOWN"
       signal: "BUY", "SELL", or None (flip on last bar)
@@ -218,37 +219,134 @@ def compute_supertrend_signals(ohlc, period=10, multiplier=3.0):
     return trend_dir, signal
 
 
-# ========= INDICATORS =========
-def fetch_indicators(ticker):
-    out = {"rsi": None, "macd": None, "adx": None}
+# ========= LOCAL INDICATORS (RSI, MACD, ADX) =========
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        if diff >= 0:
+            gains.append(diff)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-diff)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rs = float("inf")
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 2)
 
-    rsi_data = mboum_get("https://api.mboum.com/v1/markets/indicators/rsi", {
-        "ticker": ticker, "interval": TIMEFRAME, "series_type": "close",
-        "time_period": "14", "limit": "1"
-    })
-    if rsi_data:
-        vals = rsi_data.get("values") or rsi_data.get("data")
-        if vals:
-            out["rsi"] = clean_number(vals[-1].get("rsi") or vals[-1].get("RSI"))
 
-    macd_data = mboum_get("https://api.mboum.com/v1/markets/indicators/macd", {
-        "ticker": ticker, "interval": TIMEFRAME, "series_type": "close",
-        "fastperiod": "12", "slowperiod": "26", "signalperiod": "9", "limit": "1"
-    })
-    if macd_data:
-        vals = macd_data.get("values") or macd_data.get("data")
-        if vals:
-            out["macd"] = clean_number(vals[-1].get("macd") or vals[-1].get("MACD"))
+def compute_macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow + signal:
+        return None
+    def ema(values, period):
+        k = 2 / (period + 1)
+        ema_vals = [sum(values[:period]) / period]
+        for v in values[period:]:
+            ema_vals.append(v * k + ema_vals[-1] * (1 - k))
+        return ema_vals
 
-    adx_data = mboum_get("https://api.mboum.com/v1/markets/indicators/adx", {
-        "ticker": ticker, "interval": TIMEFRAME, "time_period": "14", "limit": "1"
-    })
-    if adx_data:
-        vals = adx_data.get("values") or adx_data.get("data")
-        if vals:
-            out["adx"] = clean_number(vals[-1].get("adx") or vals[-1].get("ADX"))
+    fast_ema = ema(closes, fast)
+    slow_ema = ema(closes, slow)
+    # align lengths
+    diff_len = min(len(fast_ema), len(slow_ema))
+    macd_line = [fast_ema[-diff_len + i] - slow_ema[-diff_len + i] for i in range(diff_len)]
+    if len(macd_line) < signal:
+        return None
+    signal_line = ema(macd_line, signal)
+    macd_val = macd_line[-1] - signal_line[-1]
+    return round(macd_val, 4)
 
-    return out
+
+def compute_adx(ohlc, period=14):
+    if len(ohlc) < period + 2:
+        return None
+    highs = [h for _, h, _, _ in ohlc]
+    lows = [l for _, _, l, _ in ohlc]
+    closes = [c for _, _, _, c in ohlc]
+
+    trs = []
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(ohlc)):
+        high = highs[i]
+        low = lows[i]
+        prev_high = highs[i - 1]
+        prev_low = lows[i - 1]
+        prev_close = closes[i - 1]
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close)
+        )
+        trs.append(tr)
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0.0)
+
+    def smoothed(values, period):
+        first = sum(values[:period])
+        out = [first]
+        for v in values[period:]:
+            out.append(out[-1] - (out[-1] / period) + v)
+        return out
+
+    tr_smooth = smoothed(trs, period)
+    plus_dm_smooth = smoothed(plus_dm, period)
+    minus_dm_smooth = smoothed(minus_dm, period)
+
+    if len(tr_smooth) == 0:
+        return None
+
+    plus_di = []
+    minus_di = []
+    for i in range(len(tr_smooth)):
+        if tr_smooth[i] == 0:
+            plus_di.append(0.0)
+            minus_di.append(0.0)
+        else:
+            plus_di.append(100 * (plus_dm_smooth[i] / tr_smooth[i]))
+            minus_di.append(100 * (minus_dm_smooth[i] / tr_smooth[i]))
+
+    dx = []
+    for i in range(len(plus_di)):
+        denom = plus_di[i] + minus_di[i]
+        if denom == 0:
+            dx.append(0.0)
+        else:
+            dx.append(100 * abs(plus_di[i] - minus_di[i]) / denom)
+
+    if len(dx) < period:
+        return None
+    adx_vals = smoothed(dx, period)
+    adx = adx_vals[-1] / period
+    return round(adx, 2)
+
+
+def compute_indicators_from_ohlc(ohlc):
+    closes = [c for _, _, _, c in ohlc]
+    rsi = compute_rsi(closes)
+    macd = compute_macd(closes)
+    adx = compute_adx(ohlc)
+    return {"rsi": rsi, "macd": macd, "adx": adx}
 
 
 # ========= NEWS SENTIMENT =========
@@ -299,7 +397,7 @@ def summarize_flow_strength(trades):
     return total_premium
 
 
-# ========= CONFIDENCE + CATEGORY =========
+# ========= CONFIDENCE + CATEGORIES =========
 def compute_confidence(direction, trend_dir, ind, news_score, flow_premium):
     base = 55
 
@@ -338,55 +436,59 @@ def compute_confidence(direction, trend_dir, ind, news_score, flow_premium):
     return max(10, min(99, base))
 
 
-def classify_signal_type(direction, trend_dir, confidence):
-    tag = "[ALL SIGNAL] 🔹"
-    if confidence >= 70:
-        tag = "[HIGH CONFIDENCE] 🔥"
-    if (direction == "CALL" and trend_dir == "UP") or \
-       (direction == "PUT" and trend_dir == "DOWN"):
-        tag = "[SUPER-TREND + FLOW AGREEMENT] 💎"
-    return tag
+def news_text_from_score(news_score):
+    if news_score > 0:
+        return "Positive"
+    if news_score < 0:
+        return "Negative"
+    return "Neutral"
 
 
 # ========= MESSAGE FORMATTING =========
-def format_signal_message(ticker, direction, trend_dir, ind, news_score, confidence, tag, flow_premium):
-    emoji = "🟢" if direction == "CALL" else "🔴"
-    news_text = "Neutral"
-    if news_score > 0:
-        news_text = "Positive"
-    elif news_score < 0:
-        news_text = "Negative"
+def format_multi_timeframe_message(ticker, tf_results, news_score, flow_premium):
+    lines = []
+    lines.append(f"📊 *MULTI‑TIMEFRAME SIGNAL*: {ticker}\n")
 
-    return (
-        f"{emoji} *OPTIONS SIGNAL*: {ticker}\n"
-        f"{tag}\n\n"
-        f"*Direction:* {'BULLISH (CALL)' if direction == 'CALL' else 'BEARISH (PUT)'} "
-        f"({confidence}% confidence)\n"
-        f"*SuperTrend:* {trend_dir}\n"
-        f"*Flow premium (approx):* ${flow_premium:,.0f}\n"
-        f"*RSI:* {ind['rsi']} | *MACD:* {ind['macd']} | *ADX:* {ind['adx']}\n"
-        f"*News sentiment:* {news_text}\n"
-        f"*Timeframe:* {TIMEFRAME}\n"
-    )
+    news_text = news_text_from_score(news_score)
+
+    # Order timeframes nicely
+    order = ["1m", "5m", "15m", "1h"]
+    for tf in order:
+        if tf not in tf_results:
+            continue
+        r = tf_results[tf]
+        direction = r["direction"]
+        emoji = "🟢" if direction == "CALL" else "🔴"
+        conf = r["confidence"]
+        trend_dir = r["trend_dir"]
+        rsi = r["ind"]["rsi"]
+        macd = r["ind"]["macd"]
+        adx = r["ind"]["adx"]
+
+        lines.append(
+            f"{emoji} *({tf})* {direction} — {conf}% confidence\n"
+            f"SuperTrend: {trend_dir}\n"
+            f"RSI: {rsi} | MACD: {macd} | ADX: {adx}\n"
+            f"Flow Premium: ${flow_premium:,.0f}\n"
+            f"News Sentiment: {news_text}\n"
+        )
+
+    return "\n".join(lines).strip()
 
 
-def format_agreement_message(ticker, direction, trend_dir, ind, news_score, confidence, flow_premium):
-    news_text = "Neutral"
-    if news_score > 0:
-        news_text = "Positive"
-    elif news_score < 0:
-        news_text = "Negative"
+def format_agreement_message(ticker, direction, trend_dir, ind, news_score, confidence, flow_premium, timeframe):
+    news_text = news_text_from_score(news_score)
 
     return (
         "💎 *SUPER-TREND + FLOW AGREEMENT* 💎\n\n"
         f"*Ticker:* {ticker}\n"
+        f"*Timeframe:* {timeframe}\n"
         f"*Direction:* {'BULLISH (CALL)' if direction == 'CALL' else 'BEARISH (PUT)'}\n"
         f"*Confidence:* {confidence}%\n"
         f"*SuperTrend:* {trend_dir}\n"
         f"*Flow premium (approx):* ${flow_premium:,.0f}\n"
         f"*RSI:* {ind['rsi']} | *MACD:* {ind['macd']} | *ADX:* {ind['adx']}\n"
-        f"*News sentiment:* {news_text}\n"
-        f"*Timeframe:* {TIMEFRAME}\n\n"
+        f"*News sentiment:* {news_text}\n\n"
         "This is a high‑quality alignment between trend and flow."
     )
 
@@ -398,7 +500,7 @@ def format_startup_message():
         "The market is now *OPEN*.\n"
         "SuperTrend + Flow Bot is *LIVE* and scanning your watchlist:\n\n"
         f"{wl}\n\n"
-        f"*Timeframe:* {TIMEFRAME}\n"
+        "Timeframes: 1m, 5m, 15m, 1h\n"
         "Let’s catch some moves today."
     )
 
@@ -414,7 +516,7 @@ def format_closing_message():
 
 # ========= MAIN LOOP =========
 def main():
-    logging.info("🚀 SuperTrend + Flow combined bot started")
+    logging.info("🚀 SuperTrend + Flow multi‑timeframe bot started")
 
     if not MBOUM_API_KEY:
         logging.error("Missing MBOUM_API_KEY")
@@ -452,51 +554,67 @@ def main():
 
         # ========== SCANNING LOOP ==========
         for ticker in WATCHLIST:
-            logging.info(f"🔍 Scanning {ticker} on {TIMEFRAME}...")
+            logging.info(f"🔍 Scanning {ticker} on {TIMEFRAMES}...")
 
-            # 1) OHLC + SuperTrend
-            ohlc = fetch_ohlc(ticker, TIMEFRAME)
-            if len(ohlc) < 20:
-                logging.info(f"Not enough OHLC data for {ticker}")
-                continue
-
-            trend_dir, st_signal = compute_supertrend_signals(ohlc)
-            if st_signal is None:
-                # No fresh flip; only alert on flips
-                continue
-
-            # BUY -> CALL, SELL -> PUT
-            direction = "CALL" if st_signal == "BUY" else "PUT"
-
-            # 2) Indicators
-            ind = fetch_indicators(ticker)
-
-            # 3) News
-            news_score = fetch_news_sentiment(ticker)
-
-            # 4) Flow (unusual options) for this ticker
+            # 1) Flow + news (per ticker, shared across timeframes)
             trades = fetch_unusual_for_ticker(ticker)
             flow_premium = summarize_flow_strength(trades)
+            news_score = fetch_news_sentiment(ticker)
 
-            # 5) Confidence + category
-            confidence = compute_confidence(direction, trend_dir, ind, news_score, flow_premium)
-            tag = classify_signal_type(direction, trend_dir, confidence)
+            tf_results = {}
+            any_flip = False
+            agreement_candidate = None  # (tf, result)
 
-            # 6) Normal signal message
-            signal_msg = format_signal_message(
-                ticker, direction, trend_dir, ind, news_score, confidence, tag, flow_premium
-            )
-            logging.info(
-                f"Signal {ticker} {direction} conf={confidence} flowPrem={flow_premium:,.0f} tag={tag}"
-            )
-            send_telegram(signal_msg)
+            for tf in TIMEFRAMES:
+                ohlc = fetch_ohlc_yahoo(ticker, tf)
+                if len(ohlc) < 20:
+                    logging.info(f"Not enough OHLC data for {ticker} {tf}")
+                    continue
 
-            # 7) Separate SuperTrend + Flow Agreement message (in addition)
-            if tag == "[SUPER-TREND + FLOW AGREEMENT] 💎":
-                agreement_msg = format_agreement_message(
-                    ticker, direction, trend_dir, ind, news_score, confidence, flow_premium
-                )
-                send_telegram(agreement_msg)
+                trend_dir, st_signal = compute_supertrend_signals(ohlc)
+                # If no flip, we still infer direction from trend_dir
+                if st_signal is None:
+                    direction = "CALL" if trend_dir == "UP" else "PUT"
+                else:
+                    any_flip = True
+                    direction = "CALL" if st_signal == "BUY" else "PUT"
+
+                ind = compute_indicators_from_ohlc(ohlc)
+                confidence = compute_confidence(direction, trend_dir, ind, news_score, flow_premium)
+
+                tf_results[tf] = {
+                    "direction": direction,
+                    "trend_dir": trend_dir,
+                    "ind": ind,
+                    "confidence": confidence,
+                    "flipped": st_signal is not None,
+                }
+
+                # Candidate for agreement: 5m + flow + aligned direction
+                if tf == "5m" and st_signal is not None:
+                    if (direction == "CALL" and trend_dir == "UP") or (direction == "PUT" and trend_dir == "DOWN"):
+                        agreement_candidate = (tf, tf_results[tf])
+
+            # Only send combined message when ANY timeframe has a SuperTrend flip
+            if any_flip and tf_results:
+                msg = format_multi_timeframe_message(ticker, tf_results, news_score, flow_premium)
+                logging.info(f"Sending multi‑timeframe signal for {ticker}")
+                send_telegram(msg)
+
+                # Separate agreement message if 5m + flow align
+                if agreement_candidate is not None:
+                    tf, res = agreement_candidate
+                    agreement_msg = format_agreement_message(
+                        ticker,
+                        res["direction"],
+                        res["trend_dir"],
+                        res["ind"],
+                        news_score,
+                        res["confidence"],
+                        flow_premium,
+                        tf
+                    )
+                    send_telegram(agreement_msg)
 
         time.sleep(SCAN_INTERVAL)
 
