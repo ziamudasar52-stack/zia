@@ -1,17 +1,19 @@
 import os
 import time
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
 import yfinance as yf
 
 # ------------------ CONFIG ------------------
+
 WATCHLIST = [
     "SLV", "GLD", "NFLX", "META", "AAPL", "TSLA", "NVDA", "GOOG", "MSFT",
     "AMZN", "SPY", "SPX", "AMD", "PLTR", "QQQ", "ORCL", "IBM", "ABNB"
 ]
+
 TIMEFRAMES = ["1m", "5m", "15m", "1h"]
 
 MBOUM_API_KEY = os.getenv("MBOUM_API_KEY")
@@ -21,10 +23,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TZ_NY = ZoneInfo("America/New_York")
 US_HOLIDAYS = {(1, 1), (7, 4), (12, 25)}
 
-# Scan every 90 seconds (reduced load on Yahoo)
-SCAN_INTERVAL = 90
+SCAN_INTERVAL = 90  # Reduced Yahoo load
 
-# Smart TTL per timeframe (seconds)
+# Smart TTL per timeframe
 CACHE_TTL_MAP = {
     "1m": 30,
     "5m": 60,
@@ -32,8 +33,13 @@ CACHE_TTL_MAP = {
     "1h": 300,
 }
 
-# (ticker, timeframe) -> {"ts": datetime, "ohlc": list}
+# Cache: (ticker, timeframe) -> {"ts": datetime, "ohlc": list}
 ohlc_cache = {}
+
+# Cooldown system: ticker -> datetime until next allowed fetch
+ticker_cooldown = {}
+COOLDOWN_SECONDS = 300  # 5 minutes
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +47,7 @@ logging.basicConfig(
 )
 
 # ------------------ HELPERS ------------------
+
 def clean_number(v):
     if v is None:
         return None
@@ -103,20 +110,27 @@ def mboum_get(url, params=None):
         logging.error(f"Mboum request error: {e}")
         return None
 
-# ------------------ YAHOO WITH CACHING + RETRIES ------------------
+# ------------------ YAHOO WITH CACHING + COOLDOWN ------------------
+
 def fetch_ohlc_yahoo(ticker, interval, retries=3):
     now = now_ny()
     key = (ticker, interval)
     ttl = CACHE_TTL_MAP.get(interval, 60)
 
-    # Use cache if fresh
+    # Cooldown check
+    cd = ticker_cooldown.get(ticker)
+    if cd and now < cd:
+        logging.warning(f"{ticker} cooling down until {cd}, skipping Yahoo fetch.")
+        return []
+
+    # Cache check
     cached = ohlc_cache.get(key)
     if cached:
         age = (now - cached["ts"]).total_seconds()
         if age < ttl:
             return cached["ohlc"]
 
-    # Otherwise fetch fresh
+    # Fetch fresh
     for attempt in range(retries):
         try:
             data = yf.download(
@@ -137,17 +151,23 @@ def fetch_ohlc_yahoo(ticker, interval, retries=3):
                         continue
                     ohlc.append((o, h, l, c))
 
-                # update cache
                 ohlc_cache[key] = {"ts": now, "ohlc": ohlc}
                 return ohlc
+
         except Exception as e:
             logging.error(f"Yahoo error {ticker} {interval}: {e}")
+
         time.sleep(1)
 
-    logging.error(f"Yahoo failed for {ticker} {interval}")
+    # All retries failed → activate cooldown
+    ticker_cooldown[ticker] = now + timedelta(seconds=COOLDOWN_SECONDS)
+    logging.error(
+        f"Yahoo failed for {ticker} {interval}. Cooldown activated for {COOLDOWN_SECONDS} seconds."
+    )
     return []
 
 # ------------------ SUPERTREND ------------------
+
 def compute_atr(ohlc, p=10):
     if len(ohlc) < p + 1:
         return []
@@ -166,6 +186,7 @@ def compute_atr(ohlc, p=10):
 def compute_supertrend_signals(ohlc, p=10, m=3.0):
     if len(ohlc) < p + 5:
         return (None, None)
+
     atr = compute_atr(ohlc, p)
     n = len(ohlc)
     upper = [None] * n
@@ -176,6 +197,7 @@ def compute_supertrend_signals(ohlc, p=10, m=3.0):
         o, h, l, c = ohlc[i]
         if atr[i] is None:
             continue
+
         hl2 = (h + l) / 2
         basic_upper = hl2 - m * atr[i]
         basic_lower = hl2 + m * atr[i]
@@ -211,6 +233,7 @@ def compute_supertrend_signals(ohlc, p=10, m=3.0):
     return ("UP" if last == 1 else "DOWN", flip)
 
 # ------------------ INDICATORS ------------------
+
 def compute_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -309,16 +332,8 @@ def compute_adx(ohlc, period=14):
     adx = adx_vals[-1] / period
     return round(adx, 2)
 
-
-def compute_indicators(ohlc):
-    closes = [x[3] for x in ohlc]
-    return {
-        "rsi": compute_rsi(closes),
-        "macd": compute_macd(closes),
-        "adx": compute_adx(ohlc),
-    }
-
 # ------------------ NEWS + FLOW ------------------
+
 def fetch_news_sentiment(ticker):
     data = mboum_get(
         "https://api.mboum.com/v2/markets/news",
@@ -364,13 +379,25 @@ def summarize_flow(trades):
             total += p
     return total
 
-# ------------------ CONFIDENCE + TEXT ------------------
+# ------------------ CONFIDENCE + FORMATTING ------------------
+
+def compute_indicators(ohlc):
+    closes = [x[3] for x in ohlc]
+    return {
+        "rsi": compute_rsi(closes),
+        "macd": compute_macd(closes),
+        "adx": compute_adx(ohlc),
+    }
+
+
 def compute_conf(direction, trend, indicators, news_score, flow_premium):
     base = 55
+
     if flow_premium >= 100000:
         base += 10
     if flow_premium >= 250000:
         base += 10
+
     if direction == "CALL" and trend == "UP":
         base += 15
     if direction == "PUT" and trend == "DOWN":
@@ -454,7 +481,9 @@ def startup_msg():
 
 def close_msg():
     return "🌙 *Market Closed*\n\nBot paused until tomorrow."
+
 # ------------------ MAIN LOOP ------------------
+
 def main():
     logging.info("🚀 Bot started")
 
@@ -470,18 +499,18 @@ def main():
         dt = now_ny()
         today = dt.date()
 
-        # Reset daily flags
+        # Reset only when the date changes
         if today != last_date:
             sent_start = False
             sent_close = False
             last_date = today
 
-        # Startup message
+        # Startup message once per day
         if is_market_open(dt) and not sent_start:
             send_telegram(startup_msg())
             sent_start = True
 
-        # Closing message
+        # Closing message once per day
         if dt.time() > dtime(16, 30) and not sent_close:
             send_telegram(close_msg())
             sent_close = True
@@ -491,7 +520,7 @@ def main():
             time.sleep(60)
             continue
 
-        # ------------------ SCAN LOOP ------------------
+        # -------- SCAN LOOP --------
         for ticker in WATCHLIST:
             logging.info(f"🔍 Scanning {ticker} on {TIMEFRAMES}...")
 
@@ -523,10 +552,8 @@ def main():
                 if trend is None:
                     continue
 
-                # Base direction from trend
                 direction = "CALL" if trend == "UP" else "PUT"
 
-                # Flip overrides direction
                 if flip == "BUY":
                     any_flip = True
                     direction = "CALL"
@@ -562,13 +589,13 @@ def main():
                     agree_msg = format_agree(ticker, tf, res, news_score, flow_premium)
                     send_telegram(agree_msg)
 
-            # Small delay between tickers to reduce Yahoo load
+            # Small delay between tickers
             time.sleep(0.5)
 
         # Sleep between full scans
         time.sleep(SCAN_INTERVAL)
 
-
 # ------------------ ENTRYPOINT ------------------
+
 if __name__ == "__main__":
     main()
