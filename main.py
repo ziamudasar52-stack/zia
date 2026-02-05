@@ -457,6 +457,7 @@ def close_msg():
 # ------------------ MAIN LOOP ------------------
 def main():
     logging.info("🚀 Bot started")
+
     if not MBOUM_API_KEY:
         logging.error("Missing Mboum API key")
         return
@@ -469,29 +470,37 @@ def main():
         dt = now_ny()
         today = dt.date()
 
-        # New day reset
+        # Reset daily flags
         if today != last_date:
             sent_start = False
             sent_close = False
             last_date = today
 
-        # Startup / close messages
+        # Startup message
         if is_market_open(dt) and not sent_start:
             send_telegram(startup_msg())
             sent_start = True
 
+        # Closing message
         if dt.time() > dtime(16, 30) and not sent_close:
             send_telegram(close_msg())
             sent_close = True
 
-        # If market closed, just sleep
+        # If market closed, sleep
         if not is_market_open(dt):
             time.sleep(60)
             continue
 
-        # -------- SCAN LOOP --------
+        # ------------------ SCAN LOOP ------------------
         for ticker in WATCHLIST:
             logging.info(f"🔍 Scanning {ticker} on {TIMEFRAMES}...")
+
+            # Skip ticker if cooling down
+            cd = ticker_cooldown.get(ticker)
+            now = now_ny()
+            if cd and now < cd:
+                logging.warning(f"{ticker} cooling down until {cd}, skipping.")
+                continue
 
             # Fetch flow + news once per ticker
             trades = fetch_unusual_for_ticker(ticker)
@@ -502,8 +511,10 @@ def main():
             any_flip = False
             agreement = None  # (timeframe, result)
 
+            # -------- TIMEFRAME LOOP --------
             for tf in TIMEFRAMES:
                 ohlc = fetch_ohlc_yahoo(ticker, tf)
+
                 if len(ohlc) < 20:
                     logging.info(f"Not enough OHLC data for {ticker} {tf}")
                     continue
@@ -515,7 +526,7 @@ def main():
                 # Base direction from trend
                 direction = "CALL" if trend == "UP" else "PUT"
 
-                # If flip, we treat as fresh signal in that direction
+                # Flip overrides direction
                 if flip == "BUY":
                     any_flip = True
                     direction = "CALL"
@@ -534,30 +545,30 @@ def main():
                     "flip": flip,
                 }
 
-                # Agreement condition on 5m: flip + trend aligned with direction
+                # Agreement logic on 5m
                 if tf == "5m" and flip and (
                     (direction == "CALL" and trend == "UP") or
                     (direction == "PUT" and trend == "DOWN")
                 ):
                     agreement = (tf, tf_results[tf])
 
-            # If any timeframe flipped, send multi‑timeframe summary
+            # -------- SEND SIGNALS --------
             if any_flip and tf_results:
                 msg = format_multi(ticker, tf_results, news_score, flow_premium)
                 send_telegram(msg)
 
-                # If we also have a strong agreement on 5m, send special message
                 if agreement:
                     tf, res = agreement
                     agree_msg = format_agree(ticker, tf, res, news_score, flow_premium)
                     send_telegram(agree_msg)
 
-            # Small delay between tickers to ease Yahoo load
+            # Small delay between tickers to reduce Yahoo load
             time.sleep(0.5)
 
         # Sleep between full scans
         time.sleep(SCAN_INTERVAL)
 
 
+# ------------------ ENTRYPOINT ------------------
 if __name__ == "__main__":
     main()
